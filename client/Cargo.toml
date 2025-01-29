@@ -1,0 +1,9 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-std = "1.13.0"
+common = { path = "../common" }
+tokio = { version = "1.43.0", features = ["full"] }
