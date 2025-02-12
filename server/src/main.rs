@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let username = prompt("Enter username: ").await?;
 
-    let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
+    let tcp_listener = TcpListener::bind("0.0.0.0:8080").await?;
     println!("Server listening on port 8080");
 
     let Ok((mut stream, _)) = tcp_listener.accept().await else {
