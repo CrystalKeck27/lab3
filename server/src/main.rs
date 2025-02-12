@@ -1,99 +1,108 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_std::fs::File;
-use async_std::{net::TcpListener, sync::Mutex};
 use async_std::prelude::*;
-use common::{send, ClientRequest, ClientRequestType, ServerResponse, ServerResponseType};
+use async_std::{net::TcpListener, sync::Mutex};
+use common::{decrypt, encrypt, prompt};
 
-type Database = Arc<Mutex<HashMap<u16, f32>>>;
 type LogFile = Arc<Mutex<File>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client_public_key_file = File::open("../client_public_key.pem").await?;
+    let mut server_private_key_file = File::open("../server_private_key.pem").await?;
+    let client_public_key = common::file_to_pub_key(&mut client_public_key_file).await?;
+    let server_private_key = common::file_to_priv_key(&mut server_private_key_file).await?;
 
-    let database: Database = Arc::new(Mutex::new(HashMap::new()));
     let logfile = Arc::new(Mutex::new(File::create("transactions.log").await?));
 
-    let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
-    let mut incoming = tcp_listener.incoming();
+    let username = prompt("Enter username: ").await?;
 
+    let tcp_listener = TcpListener::bind("127.0.0.1:8080").await?;
     println!("Server listening on port 8080");
 
-    while let Some(stream) = incoming.next().await {
-        let stream = stream?;
-        let database = database.clone();
-        let logfile = logfile.clone();
-        tokio::spawn(async move {
-            handle_client(stream, database, logfile).await;
-        });
+    let Ok((mut stream, _)) = tcp_listener.accept().await else {
+        println!("No connection");
+        return Ok(());
+    };
+
+    drop(tcp_listener);
+
+    println!("Connection established");
+
+    loop {
+        let message = prompt("> ").await?;
+
+        if message.trim() == "exit" {
+            stream.shutdown(std::net::Shutdown::Both)?;
+            break;
+        }
+
+        let message = common::Message::new(&username, &message);
+
+        let mut logfile = logfile.lock().await;
+        let now = common::now();
+        logfile.write_all(now.as_bytes()).await?;
+        logfile.write_all(b"\n").await?;
+        logfile.write_all(message.username.as_bytes()).await?;
+        logfile.write_all(b": ").await?;
+        logfile.write_all(message.message.as_bytes()).await?;
+        logfile.write_all(b"\n").await?;
+        let message_bytes = Vec::<u8>::from(&message);
+
+        let sending_encrypted_message = encrypt(&client_public_key, &message_bytes)?;
+        let sending_encrypted_message_length =
+            (sending_encrypted_message.len() as u32).to_be_bytes();
+        stream.write_all(&sending_encrypted_message_length).await?;
+        stream.write_all(&sending_encrypted_message).await?;
+
+        let mut recieving_encrypted_message_length = [0u8; 4];
+        if let Err(e) = stream
+            .read_exact(&mut recieving_encrypted_message_length)
+            .await
+        {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("Server closed connection");
+                break;
+            } else {
+                return Err(e.into());
+            }
+        }
+        let recieving_encrypted_message_length =
+            u32::from_be_bytes(recieving_encrypted_message_length);
+        let mut recieving_encrypted_message =
+            vec![0u8; recieving_encrypted_message_length as usize];
+        if let Err(e) = stream.read_exact(&mut recieving_encrypted_message).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("Server closed connection");
+                break;
+            } else {
+                return Err(e.into());
+            }
+        }
+        let recieving_message_bytes = decrypt(&server_private_key, &recieving_encrypted_message)?;
+        let recieving_message = common::Message::from(recieving_message_bytes.as_slice());
+
+        let now = common::now();
+        logfile.write_all(now.as_bytes()).await?;
+        logfile.write_all(b"\n").await?;
+        logfile.write_all(recieving_message.username.as_bytes()).await?;
+        logfile.write_all(b": ").await?;
+        logfile.write_all(recieving_message.message.as_bytes()).await?;
+        logfile.write_all(b"\n").await?;
+        logfile.flush().await?;
+
+
+
+        // print!("\u{001B}[s");
+        // print!("\u{001B}[A");
+        // print!("\u{001B}[999D");
+        // print!("\u{001B}[S");
+        // print!("\u{001B}[L");
+        // print!("Server response: {}", recieving_message);
+        // print!("\u{001B}[u");
+        println!("{}: {}", recieving_message.username, recieving_message.message);
     }
 
     Ok(())
-}
-
-async fn handle_client(mut stream: async_std::net::TcpStream, mut database: Database, mut logfile: LogFile) {
-    let key: [u8; 32] = [0; 32];
-    let (mut encrypter, mut decrypter) = common::create_crypter(&key, &mut stream).await;
-    while let Ok(request) = common::recv(&mut stream, &mut decrypter).await {
-        let response = handle_request(request, &mut database, &mut logfile).await;
-        send(&response, &mut stream, &mut encrypter).await.unwrap();
-    }
-}
-
-async fn handle_request(request: ClientRequest, database: &mut Database, logfile: &mut LogFile) -> ServerResponse {
-    let mut db = database.lock().await;
-    let balance = db.entry(request.account_number).or_insert(1000.0);
-    let mut log = logfile.lock().await;
-
-    match request.request_type {
-        ClientRequestType::Withdraw(amount) => {
-            if *balance < amount {
-                let now = common::now();
-                log.write_all(now.as_bytes()).await.unwrap();
-                log.write_all(b"\n").await.unwrap();
-                let line = format!(" — Account: {} — Withdrawal of {} failed. Balance: {}\n", request.account_number, amount, *balance);
-                log.write_all(line.as_bytes()).await.unwrap();
-                log.flush().await.unwrap();
-                ServerResponse {
-                    account_number: request.account_number,
-                    balance: *balance,
-                    response_type: ServerResponseType::Failure,
-                }
-            } else {
-            *balance -= amount;
-            let now = common::now();
-            log.write_all(now.as_bytes()).await.unwrap();
-            log.write_all(b"\n").await.unwrap();
-            let line = format!(" — Account: {} — Withdrawal of {} successful. New balance: {}\n", request.account_number, amount, *balance);
-            log.write_all(line.as_bytes()).await.unwrap();
-            log.flush().await.unwrap();
-            ServerResponse {
-                account_number: request.account_number,
-                balance: *balance,
-                response_type: ServerResponseType::Success,
-            }}
-        }
-        ClientRequestType::Deposit(amount) => {
-            *balance += amount;
-            let now = common::now();
-            log.write_all(now.as_bytes()).await.unwrap();
-            log.write_all(b"\n").await.unwrap();
-            let line = format!(" — Account: {} — Deposit of {}. New balance: {}\n", request.account_number, amount, *balance);
-            log.write_all(line.as_bytes()).await.unwrap();
-            log.flush().await.unwrap();
-            ServerResponse {
-                account_number: request.account_number,
-                balance: *balance,
-                response_type: ServerResponseType::Success,
-            }
-        }
-        ClientRequestType::Balance => {
-            ServerResponse {
-                account_number: request.account_number,
-                balance: *balance,
-                response_type: ServerResponseType::Success,
-            }
-        }
-    }
 }

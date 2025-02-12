@@ -1,113 +1,61 @@
-use async_std::net::TcpStream;
-use common::{prompt, ClientRequest, ClientRequestType, ServerResponse, ServerResponseType};
+use async_std::{fs::File, io::{ReadExt, WriteExt}, net::TcpStream};
+use common::{decrypt, encrypt, prompt};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Hello, world!");
 
-    let account_number = loop {
-        let account_number_string = prompt("Enter your account number: ").await?;
-        if let Ok(account_number) = u16::from_str_radix(&account_number_string, 10) {
-            break account_number;
-        } else {
-            println!("Invalid account number. Please try again.");
-        }
-    };
+    let mut server_public_key_file = File::open("../server_public_key.pem").await?;
+    let mut client_private_key_file = File::open("../client_private_key.pem").await?;
+    let server_public_key = common::file_to_pub_key(&mut server_public_key_file).await?;
+    let client_private_key = common::file_to_priv_key(&mut client_private_key_file).await?;
+
+    let username = prompt("Enter username: ").await?;
 
     let mut stream = TcpStream::connect("127.0.0.1:8080").await?;
-
-    let key: [u8; 32] = [0; 32];
-    let (mut encrypter, mut decrypter) = common::create_crypter(&key, &mut stream).await;
+    println!("Connected to server");
 
     loop {
-        let command =
-            prompt("Enter command (withdraw <amount>, deposit <amount>, balance, exit): ").await?;
-        let mut splits = command.split_whitespace();
-        match splits.next() {
-            Some("withdraw") => {
-                let Some(amount_string) = splits.next() else {
-                    println!("No amount entered. Please try again.");
-                    continue;
-                };
-                let Ok(amount) = amount_string.parse::<f32>() else {
-                    println!("Invalid amount entered. Please try again.");
-                    continue;
-                };
-                let request_type = ClientRequestType::Withdraw(amount);
-                let request = ClientRequest {
-                    account_number,
-                    request_type,
-                };
+        let message = prompt("> ").await?;
 
-                common::send(&request, &mut stream, &mut encrypter).await?;
-
-                let response: ServerResponse = common::recv(&mut stream, &mut decrypter).await?;
-                match response.response_type {
-                    ServerResponseType::Success => {
-                        println!(
-                            "Server response: Withdrawal of {} successful. New balance: {}",
-                            amount, response.balance
-                        );
-                    }
-                    ServerResponseType::Failure => {
-                        println!(
-                            "Server response: Withdrawal of {} failed. Current balance: {}",
-                            amount, response.balance
-                        );
-                    }
-                }
-            }
-            Some("deposit") => {
-                let Some(amount_string) = splits.next() else {
-                    println!("No amount entered. Please try again.");
-                    continue;
-                };
-                let Ok(amount) = amount_string.parse::<f32>() else {
-                    println!("Invalid amount entered. Please try again.");
-                    continue;
-                };
-                let request_type = ClientRequestType::Deposit(amount);
-                let request = ClientRequest {
-                    account_number,
-                    request_type,
-                };
-
-                common::send(&request, &mut stream, &mut encrypter).await?;
-
-                let response: ServerResponse = common::recv(&mut stream, &mut decrypter).await?;
-                match response.response_type {
-                    ServerResponseType::Success => {
-                        println!(
-                            "Server response: Deposit of {} successful. New balance: {}",
-                            amount, response.balance
-                        );
-                    }
-                    ServerResponseType::Failure => {
-                        println!(
-                            "Server response: Deposit of {} failed. Current balance: {}",
-                            amount, response.balance
-                        );
-                    }
-                }
-            }
-            Some("balance") => {
-                let request_type = ClientRequestType::Balance;
-                let request = ClientRequest {
-                    account_number,
-                    request_type,
-                };
-
-                common::send(&request, &mut stream, &mut encrypter).await?;
-
-                let response: ServerResponse = common::recv(&mut stream, &mut decrypter).await?;
-                println!("Server response: Account balance: {}", response.balance);
-            }
-            Some("exit") => {
-                break;
-            }
-            Some(_) => println!("Invalid command. Please try again."),
-            None => println!("No command entered. Please try again."),
+        if message.trim() == "exit" {
+            stream.shutdown(std::net::Shutdown::Both)?;
+            break;
         }
+
+        let message = common::Message::new(&username, &message);
+        let message_bytes = Vec::<u8>::from(&message);
+
+        let sending_encrypted_message = encrypt(&server_public_key, &message_bytes)?;
+        let sending_encrypted_message_length = (sending_encrypted_message.len() as u32).to_be_bytes();
+        stream.write_all(&sending_encrypted_message_length).await?;
+        stream.write_all(&sending_encrypted_message).await?;
+
+        let mut recieving_encrypted_message_length = [0u8; 4];
+        if let Err(e) = stream.read_exact(&mut recieving_encrypted_message_length).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("Server closed connection");
+                break;
+            } else {
+                return Err(e.into());
+            }
+        }
+        let recieving_encrypted_message_length = u32::from_be_bytes(recieving_encrypted_message_length);
+        let mut recieving_encrypted_message = vec![0u8; recieving_encrypted_message_length as usize];
+        if let Err(e) = stream.read_exact(&mut recieving_encrypted_message).await {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                println!("Server closed connection");
+                break;
+            } else {
+                return Err(e.into());
+            }
+        }
+        let recieving_message_bytes = decrypt(&client_private_key, &recieving_encrypted_message)?;
+        let recieving_message = common::Message::from(recieving_message_bytes.as_slice());
+        
+
+        println!("{}: {}", recieving_message.username, recieving_message.message);
+
     }
 
     Ok(())

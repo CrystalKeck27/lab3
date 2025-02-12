@@ -1,6 +1,48 @@
-use async_std::io::{stdin, stdout, WriteExt};
-use openssl::{error::ErrorStack, symm::Crypter};
-use serde::{Deserialize, Serialize};
+
+use async_std::{fs::File, io::{stdin, stdout, ReadExt, WriteExt}};
+use openssl::{error::ErrorStack, pkey::{HasPublic, PKeyRef}};
+
+pub struct Message {
+    pub username: String,
+    pub message: String,
+}
+
+impl Message {
+    pub fn new(username: &str, message: &str) -> Self {
+        Self {
+            username: username.to_string(),
+            message: message.to_string(),
+        }
+    }
+}
+
+impl From<&[u8]> for Message {
+    fn from(value: &[u8]) -> Self {
+        let username_length = value[0] as usize;
+        let value = &value[1..];
+        let username = String::from_utf8(value[0..username_length].to_vec()).unwrap();
+        let value = &value[username_length..];
+        let message_length = u16::from_be_bytes([value[0], value[1]]) as usize;
+        let value = &value[2..];
+        let message = String::from_utf8(value[0..message_length].to_vec()).unwrap();
+        Self { username, message }
+    }
+}
+
+impl From<&Message> for Vec<u8> {
+    fn from(value: &Message) -> Vec<u8> {
+        let username_length = value.username.len() as u8;
+        let username = value.username.as_bytes();
+        let message_length = value.message.len() as u16;
+        let message = value.message.as_bytes();
+        let mut result = Vec::new();
+        result.push(username_length);
+        result.extend(username);
+        result.extend(&message_length.to_be_bytes());
+        result.extend(message);
+        result
+    }
+}
 
 /// Prints the provided prompt to the console and reads the user's response.
 /// Returns the user's response as a `String` with all leading and trailing whitespace removed.
@@ -12,132 +54,41 @@ pub async fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     Ok(input.trim().to_string())
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ServerResponse {
-    pub account_number: u16,
-    pub balance: f32,
-    pub response_type: ServerResponseType,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ServerResponseType {
-    Success,
-    Failure,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ClientRequestType {
-    Withdraw(f32),
-    Deposit(f32),
-    Balance,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ClientRequest {
-    pub account_number: u16,
-    pub request_type: ClientRequestType,
-}
-
-pub async fn send<A, T>(
-    request: &T,
-    stream: &mut A,
-    encrypter: &mut EnCrypter,
-) -> Result<(), std::io::Error>
-where
-    A: async_std::io::WriteExt + Unpin,
-    T: Serialize,
-{
-    let mut plain = serde_json::to_vec(&request)?;
-    plain.push(b'\n');
-    let mut len = plain.len();
-    // next multiple of 16
-    len = (len + 15) & !15;
-    plain.resize(len, b' ');
-
-    let mut cypher = vec![0u8; len];
-    unsafe {
-        encrypter.0.update_unchecked(&plain, &mut cypher).unwrap();
-    }
-
-    stream.write_all(&cypher).await?;
-    Ok(())
-}
-
-pub async fn recv<A, T>(stream: &mut A, decrypter: &mut DeCrypter) -> Result<T, std::io::Error>
-where
-    A: async_std::io::ReadExt + Unpin,
-    T: for<'de> Deserialize<'de>,
-{
-    let mut cypher = [0u8; 16];
-    let mut plain = [0u8; 16];
-    let mut full = Vec::new();
-    loop {
-        stream.read_exact(&mut cypher).await?;
-        unsafe {
-            decrypter.0.update_unchecked(&cypher, &mut plain).unwrap();
-        }
-
-        if let Some(index) = plain.iter().position(|&x| x == b'\n') {
-            full.extend_from_slice(&plain[..index]);
-
-            // Process the response
-            let response: T = serde_json::from_slice(&full)?;
-
-            return Ok(response);
-        } else {
-            full.extend_from_slice(&plain);
-        }
-    }
-}
-
-pub async fn create_crypter<A>(key: &[u8], stream: &mut A) -> (EnCrypter, DeCrypter)
-where
-    A: async_std::io::ReadExt + async_std::io::WriteExt + Unpin,
-{
-    let mut tx_iv: [u8; 16] = [0; 16];
-    openssl::rand::rand_bytes(&mut tx_iv).unwrap();
-
-    stream.write_all(&tx_iv).await.unwrap();
-    let mut rx_iv = [0u8; 16];
-    stream.read_exact(&mut rx_iv).await.unwrap();
-
-    let mut encrypter = EnCrypter::new(key, &tx_iv).unwrap();
-    encrypter.0.pad(false);
-
-    let mut decrypter = DeCrypter::new(key, &rx_iv).unwrap();
-    decrypter.0.pad(false);
-
-    (encrypter, decrypter)
-}
-
-pub struct DeCrypter(Crypter);
-pub struct EnCrypter(Crypter);
-
-impl DeCrypter {
-    fn new(key: &[u8], iv: &[u8]) -> Result<Self, ErrorStack> {
-        Crypter::new(
-            openssl::symm::Cipher::aes_256_cbc(),
-            openssl::symm::Mode::Decrypt,
-            key,
-            Some(iv),
-        )
-        .map(|crypter| DeCrypter(crypter))
-    }
-}
-
-impl EnCrypter {
-    fn new(key: &[u8], iv: &[u8]) -> Result<Self, ErrorStack> {
-        Crypter::new(
-            openssl::symm::Cipher::aes_256_cbc(),
-            openssl::symm::Mode::Encrypt,
-            key,
-            Some(iv),
-        )
-        .map(|crypter| EnCrypter(crypter))
-    }
-}
-
 pub fn now() -> String {
     let now = chrono::Local::now();
     now.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+pub fn encrypt<'a, T>(pkey: &'a PKeyRef<T>, plaintext: &[u8]) -> Result<Vec<u8>, ErrorStack>  where T: HasPublic {
+    // EVP_PKEY_encrypt_init
+    let encrypter = openssl::encrypt::Encrypter::new(pkey)?;
+    // EVP_PKEY_encrypt with null ptr
+    let cyphertext_len = encrypter.encrypt_len(plaintext)?;
+    let mut cyphertext = vec![0; cyphertext_len];
+    // EVP_PKEY_encrypt
+    encrypter.encrypt(plaintext, &mut cyphertext)?;
+    Ok(cyphertext)
+}
+
+pub fn decrypt<'a, T>(pkey: &'a PKeyRef<T>, cyphertext: &[u8]) -> Result<Vec<u8>, ErrorStack> where T: openssl::pkey::HasPrivate {
+    // EVP_PKEY_decrypt_init
+    let decrypter = openssl::encrypt::Decrypter::new(pkey)?;
+    // EVP_PKEY_decrypt with null ptr
+    let plaintext_len = decrypter.decrypt_len(cyphertext)?;
+    let mut plaintext = vec![0; plaintext_len];
+    // EVP_PKEY_decrypt
+    decrypter.decrypt(cyphertext, &mut plaintext)?;
+    Ok(plaintext)
+}
+
+pub async fn file_to_pub_key(file: &mut File) -> Result<openssl::pkey::PKey<openssl::pkey::Public>, std::io::Error> {
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    Ok(openssl::pkey::PKey::public_key_from_pem(&buf)?)
+}
+
+pub async fn file_to_priv_key(file: &mut File) -> Result<openssl::pkey::PKey<openssl::pkey::Private>, std::io::Error> {
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    Ok(openssl::pkey::PKey::private_key_from_pem(&buf)?)
 }
